@@ -1,8 +1,26 @@
-from fastapi import FastAPI
+from contextlib import asynccontextmanager
 
-app = FastAPI(title="TopGreenCloud API")
+from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
+from sqlalchemy.exc import SQLAlchemyError
+
+from app.auth import database_error, router, validation_error
+from app.config import validate_auth_config
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    validate_auth_config()
+    yield
+
+app = FastAPI(title="TopGreenCloud API", lifespan=lifespan)
+app.add_exception_handler(RequestValidationError, validation_error)
+app.add_exception_handler(SQLAlchemyError, database_error)
 
 
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "healthy"}
+
+
+app.include_router(router)
