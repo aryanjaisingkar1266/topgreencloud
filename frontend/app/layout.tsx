@@ -18,8 +18,8 @@ export default function RootLayout({ children }: Readonly<{ children: React.Reac
               TopGreenCloud
             </a>
             <nav aria-label="Main navigation">
-              <a href="#approach">Our approach</a>
-              <a className="nav-link" href="#what-is-coming">What&apos;s coming <span aria-hidden="true">↗</span></a>
+              <a href="/#providers">Compare providers</a>
+              <a className="nav-link" href="/dashboard">Dashboard <span aria-hidden="true">↗</span></a>
             </nav>
           </header>
           {children}
