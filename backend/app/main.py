@@ -6,6 +6,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from app.auth import database_error, router, validation_error
 from app.config import validate_auth_config
+from app.providers import router as providers_router
 
 
 @asynccontextmanager
@@ -24,3 +25,4 @@ def health() -> dict[str, str]:
 
 
 app.include_router(router)
+app.include_router(providers_router)
