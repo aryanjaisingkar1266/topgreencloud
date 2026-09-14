@@ -8,6 +8,7 @@ from app.auth import database_error, router, validation_error
 from app.config import validate_auth_config
 from app.providers import router as providers_router
 from app.bills import router as bills_router
+from app.carbon import router as carbon_router
 
 
 @asynccontextmanager
@@ -28,3 +29,4 @@ def health() -> dict[str, str]:
 app.include_router(router)
 app.include_router(providers_router)
 app.include_router(bills_router)
+app.include_router(carbon_router)
