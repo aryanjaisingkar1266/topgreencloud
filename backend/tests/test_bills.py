@@ -6,15 +6,15 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 from pypdf import PdfWriter
 from pypdf.generic import DictionaryObject, NameObject, DecodedStreamObject
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
 with patch.dict("os.environ", {"DATABASE_URL": "postgresql+psycopg://localhost/topgreencloud"}):
     from app import bills, config
-    from app.db import get_db
+    from app.db import Base, get_db
     from app.main import app
-    from app.models import User
+    from app.models import CarbonAnalysis, CarbonAnalysisItem, UploadedBill, User
 
 
 class BillTests(unittest.TestCase):
@@ -23,7 +23,9 @@ class BillTests(unittest.TestCase):
         settings.start()
         self.addCleanup(settings.stop)
         self.engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
-        User.__table__.create(self.engine)
+        with self.engine.connect() as connection:
+            connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+        Base.metadata.create_all(self.engine)
         self.addCleanup(self.engine.dispose)
 
         def database():
@@ -39,6 +41,8 @@ class BillTests(unittest.TestCase):
         self.assertEqual(self.client.post("/auth/register", json=credentials).status_code, 201)
         self.token = self.client.post("/auth/login", json=credentials).json()["access_token"]
         self.headers = {"Authorization": f"Bearer {self.token}"}
+        with Session(self.engine) as session:
+            self.user_id = session.scalar(select(User.id).where(User.email == credentials["email"]))
 
     def upload(self, data=b"service,cost\nExample,4.25\n", name="bill.csv", mime="text/csv"):
         return self.client.post("/bills/upload", files={"file": (name, data, mime)}, headers=self.headers)
@@ -150,6 +154,54 @@ class BillTests(unittest.TestCase):
         response = self.client.post("/bills/upload", files=[("file", ("a.csv", b"a,b")),
             ("file", ("b.csv", b"a,b"))], headers=self.headers)
         self.assertIn(response.status_code, (400, 422))
+
+    def test_bill_list_is_authenticated_owned_and_safe(self):
+        other = User(email="other-bill@example.com", password_hash="test-only")
+        with Session(self.engine) as session:
+            session.add(other); session.flush()
+            session.add_all([
+                UploadedBill(user_id=self.user_id, original_filename="mine.csv",
+                             storage_key=f"bills/{self.user_id}/{'a' * 32}.csv",
+                             file_type="csv", file_size=10, status="parsed"),
+                UploadedBill(user_id=other.id, original_filename="other.csv",
+                             storage_key=f"bills/{other.id}/{'b' * 32}.csv",
+                             file_type="csv", file_size=10, status="parsed"),
+            ])
+            session.commit()
+        self.assertEqual(self.client.get("/bills").status_code, 401)
+        response = self.client.get("/bills", headers=self.headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([bill["original_filename"] for bill in response.json()], ["mine.csv"])
+        self.assertNotIn("storage_key", response.text)
+        self.assertNotIn("user_id", response.text)
+        self.assertEqual(response.headers["cache-control"], "no-store")
+
+    def test_delete_is_owner_only_and_cascades_analysis(self):
+        with Session(self.engine) as session:
+            bill = UploadedBill(user_id=self.user_id, original_filename="mine.csv",
+                                storage_key=f"bills/{self.user_id}/{'c' * 32}.csv",
+                                file_type="csv", file_size=10, status="parsed")
+            session.add(bill); session.flush()
+            analysis = CarbonAnalysis(user_id=self.user_id, bill_id=bill.id,
+                                      methodology_version="test-only", complete=False)
+            session.add(analysis); session.flush()
+            session.add(CarbonAnalysisItem(analysis_id=analysis.id, unsupported_reason="test-only"))
+            session.commit()
+            bill_id, analysis_id = bill.id, analysis.id
+        credentials = {"email": "delete-other@example.com", "password": "private test passphrase"}
+        self.client.post("/auth/register", json=credentials)
+        other_token = self.client.post("/auth/login", json=credentials).json()["access_token"]
+        with patch.object(bills.storage, "delete_bill") as delete:
+            self.assertEqual(self.client.delete(f"/bills/{bill_id}", headers={
+                "Authorization": f"Bearer {other_token}"
+            }).status_code, 404)
+            delete.assert_not_called()
+            self.assertEqual(self.client.delete(f"/bills/{bill_id}", headers=self.headers).status_code, 204)
+            delete.assert_called_once()
+        with Session(self.engine) as session:
+            self.assertIsNone(session.get(UploadedBill, bill_id))
+            self.assertIsNone(session.get(CarbonAnalysis, analysis_id))
+            self.assertEqual(session.query(CarbonAnalysisItem).count(), 0)
 
     def test_health(self):
         self.assertEqual(self.client.get("/health").json(), {"status": "healthy"})

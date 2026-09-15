@@ -1,6 +1,7 @@
 import csv
 import logging
 import re
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from io import BytesIO, StringIO
 from typing import Annotated, Literal
@@ -61,6 +62,16 @@ class ParsedBill(BaseModel):
     row_count: int
     items: list[Item]
     warnings: list[str]
+
+
+class BillSummary(BaseModel):
+    id: int
+    original_filename: str
+    file_type: str
+    file_size: int
+    status: str
+    uploaded_at: datetime
+    provider_slug: str | None
 
 
 def normalize(values: dict[str, str], warnings: set[str]) -> Item:
@@ -246,6 +257,24 @@ def save_bill(db: Session, user_id: int, filename: str, kind: str, data: bytes, 
         except storage.StorageError:
             logging.getLogger(__name__).warning("Bill object cleanup failed")
         raise HTTPException(503, "Bill metadata could not be saved. Please try again.") from None
+
+
+@router.get("", response_model=list[BillSummary])
+def list_bills(response: Response, user: Annotated[User, Depends(get_current_user)],
+               db: Annotated[Session, Depends(get_db)]):
+    response.headers["Cache-Control"] = "no-store"
+    rows = db.execute(
+        select(UploadedBill, CloudProvider.slug)
+        .outerjoin(CloudProvider, UploadedBill.provider_id == CloudProvider.id)
+        .where(UploadedBill.user_id == user.id)
+        .order_by(UploadedBill.uploaded_at.desc(), UploadedBill.id.desc())
+        .limit(100)
+    ).all()
+    return [BillSummary(
+        id=bill.id, original_filename=bill.original_filename, file_type=bill.file_type,
+        file_size=bill.file_size, status=bill.status, uploaded_at=bill.uploaded_at,
+        provider_slug=provider_slug,
+    ) for bill, provider_slug in rows]
 
 
 @router.delete("/{bill_id}", status_code=204)

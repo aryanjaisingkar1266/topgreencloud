@@ -1,12 +1,18 @@
-from datetime import date
+import csv
+from datetime import date, datetime
 from decimal import Decimal, localcontext
+from io import StringIO
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, Response
+from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, StringConstraints
+from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session
 
 from app.auth import get_current_user
-from app.models import User
+from app.db import get_db
+from app.models import CarbonAnalysis, CarbonAnalysisItem, CloudProvider, UploadedBill, User
 
 router = APIRouter(prefix="/carbon", tags=["carbon"])
 Identifier = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=1000)]
@@ -25,6 +31,7 @@ class Usage(BaseModel):
 class CalculationRequest(BaseModel):
     # Extra billing fields from Phase 5 are ignored, never used for estimation.
     provider: Identifier | None = None
+    bill_id: int | None = Field(default=None, gt=0)
     items: list[Usage] = Field(min_length=1, max_length=10000)
 
 
@@ -62,6 +69,7 @@ class UnsupportedItem(Usage):
 
 
 class CalculationResult(BaseModel):
+    analysis_id: int | None = None
     total_kg_co2e: Decimal | None
     methodology_version: str = "exact-unit-multiplication-v1"
     complete: bool
@@ -108,8 +116,135 @@ def calculate(data: CalculationRequest, coefficients: tuple[Coefficient, ...]) -
         warnings=["Total covers calculated items only; unsupported emissions are unknown"] if unsupported else [])
 
 
+class HistoryItem(BaseModel):
+    analysis_id: int
+    bill_id: int
+    bill_filename: str
+    provider_slug: str | None
+    total_kg_co2e: Decimal | None
+    methodology_version: str
+    complete: bool
+    created_at: datetime
+
+
+def persist_analysis(db: Session, user_id: int, bill: UploadedBill,
+                     provider_slug: str | None, result: CalculationResult) -> int:
+    provider_id = bill.provider_id
+    if provider_slug:
+        provider_id = db.scalar(select(CloudProvider.id).where(CloudProvider.slug == provider_slug))
+    analysis = CarbonAnalysis(user_id=user_id, bill_id=bill.id, provider_id=provider_id,
+                              provider_slug=provider_slug, total_co2e=result.total_kg_co2e,
+                              methodology_version=result.methodology_version, complete=result.complete)
+    db.add(analysis)
+    db.flush()
+    for item in result.calculated_items:
+        db.add(CarbonAnalysisItem(
+            analysis_id=analysis.id, provider_slug=item.provider, service_name=item.service_name,
+            service_category=item.service_category, region=item.region,
+            usage_quantity=item.usage_quantity, usage_unit=item.usage_unit,
+            estimated_co2e=item.estimated_kg_co2e, kg_co2e_per_unit=item.kg_co2e_per_unit,
+            source_name=item.source.name, source_url=str(item.source.url),
+            source_methodology_version=item.source.methodology_version,
+            source_date=item.source.source_date,
+        ))
+    for item in result.unsupported_items:
+        db.add(CarbonAnalysisItem(
+            analysis_id=analysis.id, provider_slug=item.provider, service_name=item.service_name,
+            service_category=item.service_category, region=item.region,
+            usage_quantity=item.usage_quantity, usage_unit=item.usage_unit,
+            unsupported_reason=item.reason,
+        ))
+    db.commit()
+    return analysis.id
+
+
 @router.post("/calculate", response_model=CalculationResult)
 def calculate_carbon(data: CalculationRequest, response: Response,
-                     user: Annotated[User, Depends(get_current_user)]):
+                     user: Annotated[User, Depends(get_current_user)],
+                     db: Annotated[Session, Depends(get_db)]):
     response.headers["Cache-Control"] = "no-store"
-    return calculate(data, COEFFICIENTS)
+    result = calculate(data, COEFFICIENTS)
+    if data.bill_id is None:
+        return result
+    bill = db.scalar(select(UploadedBill).where(
+        UploadedBill.id == data.bill_id, UploadedBill.user_id == user.id
+    ))
+    if bill is None:
+        raise HTTPException(404, "Bill not found")
+    provider_slug = data.provider if data.provider in ("aws", "azure", "gcp") else None
+    if provider_slug is None and bill.provider_id:
+        provider_slug = db.scalar(select(CloudProvider.slug).where(CloudProvider.id == bill.provider_id))
+    try:
+        result.analysis_id = persist_analysis(db, user.id, bill, provider_slug, result)
+    except SQLAlchemyError:
+        db.rollback()
+        raise HTTPException(503, "Analysis could not be saved. Please retry.") from None
+    return result
+
+
+@router.get("/history", response_model=list[HistoryItem])
+def history(response: Response, user: Annotated[User, Depends(get_current_user)],
+            db: Annotated[Session, Depends(get_db)]):
+    response.headers["Cache-Control"] = "no-store"
+    rows = db.execute(
+        select(CarbonAnalysis, UploadedBill.original_filename)
+        .join(UploadedBill, CarbonAnalysis.bill_id == UploadedBill.id)
+        .where(CarbonAnalysis.user_id == user.id)
+        .order_by(CarbonAnalysis.created_at.desc(), CarbonAnalysis.id.desc())
+        .limit(100)
+    ).all()
+    return [HistoryItem(
+        analysis_id=analysis.id, bill_id=analysis.bill_id, bill_filename=filename,
+        provider_slug=analysis.provider_slug, total_kg_co2e=analysis.total_co2e,
+        methodology_version=analysis.methodology_version, complete=analysis.complete,
+        created_at=analysis.created_at,
+    ) for analysis, filename in rows]
+
+
+def csv_cell(value, text: bool = False) -> str:
+    if value is None:
+        return ""
+    result = value.isoformat() if isinstance(value, (date, datetime)) else str(value)
+    return "'" + result if text and result.startswith(("=", "+", "-", "@")) else result
+
+
+@router.get("/history/{analysis_id}/export.csv")
+def export_history(analysis_id: int, user: Annotated[User, Depends(get_current_user)],
+                   db: Annotated[Session, Depends(get_db)]):
+    row = db.execute(
+        select(CarbonAnalysis, UploadedBill.original_filename)
+        .join(UploadedBill, CarbonAnalysis.bill_id == UploadedBill.id)
+        .where(CarbonAnalysis.id == analysis_id, CarbonAnalysis.user_id == user.id)
+    ).one_or_none()
+    if row is None:
+        raise HTTPException(404, "Analysis not found")
+    analysis, filename = row
+    items = db.scalars(select(CarbonAnalysisItem).where(
+        CarbonAnalysisItem.analysis_id == analysis.id
+    ).order_by(CarbonAnalysisItem.id)).all()
+    columns = [
+        "analysis_id", "bill_id", "bill_filename", "analysis_created_at", "analysis_provider",
+        "analysis_total_kg_co2e", "analysis_complete", "methodology_version", "item_provider",
+        "service_name", "service_category", "region", "usage_quantity", "usage_unit",
+        "estimated_kg_co2e", "kg_co2e_per_unit", "unsupported_reason", "source_name",
+        "source_url", "source_methodology_version", "source_date",
+    ]
+    output = StringIO(newline="")
+    writer = csv.writer(output, lineterminator="\n")
+    writer.writerow(columns)
+    for item in items:
+        writer.writerow([
+            analysis.id, analysis.bill_id, csv_cell(filename, True), analysis.created_at.isoformat(),
+            csv_cell(analysis.provider_slug, True), csv_cell(analysis.total_co2e), analysis.complete,
+            csv_cell(analysis.methodology_version, True), csv_cell(item.provider_slug, True),
+            csv_cell(item.service_name, True), csv_cell(item.service_category, True),
+            csv_cell(item.region, True), csv_cell(item.usage_quantity), csv_cell(item.usage_unit, True),
+            csv_cell(item.estimated_co2e), csv_cell(item.kg_co2e_per_unit),
+            csv_cell(item.unsupported_reason, True), csv_cell(item.source_name, True),
+            csv_cell(item.source_url, True), csv_cell(item.source_methodology_version, True),
+            csv_cell(item.source_date),
+        ])
+    return Response(output.getvalue(), media_type="text/csv", headers={
+        "Content-Disposition": f'attachment; filename="topgreencloud-analysis-{analysis.id}.csv"',
+        "Cache-Control": "no-store",
+    })
