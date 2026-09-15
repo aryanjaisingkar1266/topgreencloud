@@ -1,0 +1,145 @@
+name: TopGreenCloud CI/CD
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: topgreencloud-production
+  cancel-in-progress: false
+
+jobs:
+  test-build-deploy:
+    runs-on: ubuntu-latest
+    env:
+      GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      GCP_REGION: ${{ vars.GCP_REGION }}
+      GAR_REPOSITORY: ${{ vars.GAR_REPOSITORY }}
+      GKE_CLUSTER: ${{ vars.GKE_CLUSTER }}
+      GKE_LOCATION: ${{ vars.GKE_LOCATION }}
+      APP_DOMAIN: ${{ vars.APP_DOMAIN }}
+      GCS_BUCKET: ${{ vars.GCS_BUCKET }}
+      CLOUD_SQL_INSTANCE: ${{ vars.CLOUD_SQL_INSTANCE }}
+      BACKEND_GSA_EMAIL: ${{ vars.BACKEND_GSA_EMAIL }}
+      STATIC_IP_NAME: ${{ vars.STATIC_IP_NAME }}
+      GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      GCP_DEPLOY_SERVICE_ACCOUNT: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+      BACKEND_IMAGE: ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.GAR_REPOSITORY }}/topgreencloud-backend:${{ github.sha }}
+      FRONTEND_IMAGE: ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/${{ vars.GAR_REPOSITORY }}/topgreencloud-frontend:${{ github.sha }}
+      MANIFEST_DIR: ${{ runner.temp }}/topgreencloud-k8s
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Test backend
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m unittest discover -s tests -q
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Build frontend
+        working-directory: frontend
+        env:
+          NEXT_PUBLIC_API_BASE_URL: https://example.invalid
+        run: |
+          npm ci
+          npm run build
+
+      - name: Verify deployment variables
+        run: |
+          for name in GCP_PROJECT_ID GCP_REGION GAR_REPOSITORY GKE_CLUSTER GKE_LOCATION APP_DOMAIN GCS_BUCKET CLOUD_SQL_INSTANCE BACKEND_GSA_EMAIL STATIC_IP_NAME GCP_WORKLOAD_IDENTITY_PROVIDER GCP_DEPLOY_SERVICE_ACCOUNT; do
+            if [ -z "${!name}" ]; then
+              echo "Repository variable $name is required."
+              exit 1
+            fi
+          done
+
+      - id: auth
+        name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v3
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+      - name: Set up Google Cloud CLI
+        uses: google-github-actions/setup-gcloud@v3
+
+      - name: Configure Artifact Registry authentication
+        run: gcloud auth configure-docker "${GCP_REGION}-docker.pkg.dev" --quiet
+
+      - name: Build and push images
+        run: |
+          docker build -t "$BACKEND_IMAGE" backend
+          docker build --build-arg NEXT_PUBLIC_API_BASE_URL="https://${APP_DOMAIN}" -t "$FRONTEND_IMAGE" frontend
+          docker push "$BACKEND_IMAGE"
+          docker push "$FRONTEND_IMAGE"
+
+      - id: gke
+        name: Get GKE credentials
+        uses: google-github-actions/get-gke-credentials@v3
+        with:
+          cluster_name: ${{ vars.GKE_CLUSTER }}
+          location: ${{ vars.GKE_LOCATION }}
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+
+      - name: Render Kubernetes manifests in runner temp storage
+        run: |
+          mkdir -p "$MANIFEST_DIR"
+          cp k8s/config.yaml k8s/backend.yaml k8s/frontend.yaml k8s/ingress.yaml "$MANIFEST_DIR/"
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          manifest_dir = Path(os.environ["MANIFEST_DIR"])
+          replacements = {
+              "REGION-docker.pkg.dev/PROJECT_ID/REPOSITORY/topgreencloud-backend:IMAGE_TAG": os.environ["BACKEND_IMAGE"],
+              "REGION-docker.pkg.dev/PROJECT_ID/REPOSITORY/topgreencloud-frontend:IMAGE_TAG": os.environ["FRONTEND_IMAGE"],
+              "PROJECT_ID:REGION:INSTANCE_NAME": os.environ["CLOUD_SQL_INSTANCE"],
+              "https://YOUR_DOMAIN": f"https://{os.environ['APP_DOMAIN']}",
+              "YOUR_DOMAIN": os.environ["APP_DOMAIN"],
+              "YOUR_GCS_BUCKET": os.environ["GCS_BUCKET"],
+              "YOUR_PROJECT_ID": os.environ["GCP_PROJECT_ID"],
+              "YOUR_GSA_EMAIL": os.environ["BACKEND_GSA_EMAIL"],
+              "YOUR_STATIC_IP_NAME": os.environ["STATIC_IP_NAME"],
+          }
+          for path in manifest_dir.glob("*.yaml"):
+              text = path.read_text()
+              for placeholder, value in replacements.items():
+                  text = text.replace(placeholder, value)
+              path.write_text(text)
+          PY
+
+      - name: Deploy configuration and verify runtime Secret
+        run: |
+          kubectl apply -f "$MANIFEST_DIR/config.yaml"
+          kubectl get namespace topgreencloud
+          kubectl -n topgreencloud get secret topgreencloud-secrets
+
+      - name: Deploy application and ingress
+        run: |
+          kubectl apply -f "$MANIFEST_DIR/backend.yaml"
+          kubectl apply -f "$MANIFEST_DIR/frontend.yaml"
+          kubectl apply -f "$MANIFEST_DIR/ingress.yaml"
+
+      - name: Wait for rollouts
+        run: |
+          kubectl rollout status deployment/topgreencloud-backend -n topgreencloud --timeout=5m
+          kubectl rollout status deployment/topgreencloud-frontend -n topgreencloud --timeout=5m
+
+      - name: Show deployment status
+        run: kubectl get deployments,pods,services,ingress -n topgreencloud
