@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: topgreencloud
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: topgreencloud-config
+  namespace: topgreencloud
+data:
+  FRONTEND_URL: https://YOUR_DOMAIN
+  JWT_ALGORITHM: HS256
+  ACCESS_TOKEN_EXPIRE_MINUTES: "30"
+  GCS_BUCKET: YOUR_GCS_BUCKET
+  GCP_PROJECT_ID: YOUR_PROJECT_ID
+  CLOUD_SQL_INSTANCE: PROJECT_ID:REGION:INSTANCE_NAME
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: topgreencloud-backend
+  namespace: topgreencloud
+  annotations:
+    iam.gke.io/gcp-service-account: YOUR_GSA_EMAIL

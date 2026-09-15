@@ -1,0 +1,149 @@
+apiVersion: cloud.google.com/v1
+kind: BackendConfig
+metadata:
+  name: topgreencloud-backend
+  namespace: topgreencloud
+spec:
+  healthCheck:
+    type: HTTP
+    requestPath: /health
+    port: 8000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: topgreencloud-backend
+  namespace: topgreencloud
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: topgreencloud-backend
+  template:
+    metadata:
+      labels:
+        app: topgreencloud-backend
+    spec:
+      serviceAccountName: topgreencloud-backend
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+      containers:
+        - name: topgreencloud-backend
+          image: REGION-docker.pkg.dev/PROJECT_ID/REPOSITORY/topgreencloud-backend:IMAGE_TAG
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c", "alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port 8000"]
+          ports:
+            - containerPort: 8000
+              name: http
+          envFrom:
+            - configMapRef:
+                name: topgreencloud-config
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: topgreencloud-secrets
+                  key: DATABASE_URL
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: topgreencloud-secrets
+                  key: JWT_SECRET
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            failureThreshold: 24
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 20
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+        - name: cloud-sql-proxy
+          image: gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.25.0
+          args:
+            - --address=127.0.0.1
+            - --port=5432
+            - --private-ip
+            - --health-check
+            - --http-address=0.0.0.0
+            - --http-port=9801
+            - $(CLOUD_SQL_INSTANCE)
+          ports:
+            - containerPort: 9801
+              name: health
+          env:
+            - name: CLOUD_SQL_INSTANCE
+              valueFrom:
+                configMapKeyRef:
+                  name: topgreencloud-config
+                  key: CLOUD_SQL_INSTANCE
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+          startupProbe:
+            httpGet:
+              path: /startup
+              port: 9801
+            periodSeconds: 5
+            failureThreshold: 24
+          readinessProbe:
+            httpGet:
+              path: /readiness
+              port: 9801
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /liveness
+              port: 9801
+            periodSeconds: 20
+            failureThreshold: 3
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: topgreencloud-backend
+  namespace: topgreencloud
+  annotations:
+    cloud.google.com/neg: '{"ingress": true}'
+    cloud.google.com/backend-config: '{"default": "topgreencloud-backend"}'
+spec:
+  type: ClusterIP
+  selector:
+    app: topgreencloud-backend
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http

@@ -1,0 +1,72 @@
+apiVersion: networking.gke.io/v1
+kind: ManagedCertificate
+metadata:
+  name: topgreencloud-managed-cert
+  namespace: topgreencloud
+spec:
+  domains:
+    - YOUR_DOMAIN
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: topgreencloud
+  namespace: topgreencloud
+  annotations:
+    kubernetes.io/ingress.class: gce
+    kubernetes.io/ingress.global-static-ip-name: YOUR_STATIC_IP_NAME
+    networking.gke.io/managed-certificates: topgreencloud-managed-cert
+spec:
+  rules:
+    - host: YOUR_DOMAIN
+      http:
+        paths:
+          - path: /auth
+            pathType: Exact
+            backend:
+              service:
+                name: topgreencloud-frontend
+                port:
+                  name: http
+          - path: /auth
+            pathType: Prefix
+            backend:
+              service:
+                name: topgreencloud-backend
+                port:
+                  name: http
+          - path: /providers
+            pathType: Prefix
+            backend:
+              service:
+                name: topgreencloud-backend
+                port:
+                  name: http
+          - path: /bills
+            pathType: Prefix
+            backend:
+              service:
+                name: topgreencloud-backend
+                port:
+                  name: http
+          - path: /carbon
+            pathType: Prefix
+            backend:
+              service:
+                name: topgreencloud-backend
+                port:
+                  name: http
+          - path: /health
+            pathType: Prefix
+            backend:
+              service:
+                name: topgreencloud-backend
+                port:
+                  name: http
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: topgreencloud-frontend
+                port:
+                  name: http
