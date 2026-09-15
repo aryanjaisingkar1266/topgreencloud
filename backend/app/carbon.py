@@ -55,6 +55,15 @@ class Coefficient(BaseModel):
 
 # Add only reviewed, traceable factors with exact applicability and units here.
 # Source metadata alone does not establish scientific validity. No defaults apply.
+# Review 2026-09-15: none of these methods publishes an exact factor for our key.
+# AWS model 3.0 requires cluster/rack emissions and customer allocation:
+# https://sustainability.aboutamazon.com/aws-customer-carbon-footprint-tool-methodology.pdf
+# Google requires measured energy and hourly allocation:
+# https://docs.cloud.google.com/carbon-footprint/docs/methodology
+# Azure combines consumption with internal energy/carbon data:
+# https://learn.microsoft.com/en-us/power-bi/connect-data/service-connect-to-emissions-impact-dashboard
+# Cloud Carbon Footprint also needs utilization/conversion assumptions, not a direct factor:
+# https://www.cloudcarbonfootprint.org/docs/methodology/
 COEFFICIENTS: tuple[Coefficient, ...] = ()
 
 

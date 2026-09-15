@@ -132,6 +132,28 @@ class CarbonTests(unittest.TestCase):
     def test_source_validation(self):
         with self.assertRaises(ValidationError):
             carbon.Source(name="", url="not-a-url", methodology_version="")
+        for field in ("name", "url", "methodology_version"):
+            with self.subTest(missing=field), self.assertRaises(ValidationError):
+                carbon.Source(**{key: value for key, value in self.factor.source.model_dump().items()
+                                 if key != field})
+        with self.assertRaises(ValidationError):
+            carbon.Coefficient(**self.factor.model_dump(exclude={"source"}))
+
+    def test_reference_metrics_do_not_supply_default_factors_or_near_matches(self):
+        self.assertEqual(carbon.COEFFICIENTS, ())
+        for provider in ("aws", "azure", "gcp"):
+            result = carbon.calculate(carbon.CalculationRequest(items=[self.item | {"provider": provider}]),
+                                      carbon.COEFFICIENTS)
+            self.assertIsNone(result.total_kg_co2e)
+            self.assertEqual(result.calculated_items, [])
+            self.assertNotIn("estimated_kg_co2e", result.unsupported_items[0].model_dump())
+        for field in ("provider", "service_name", "service_category", "region", "usage_unit"):
+            with self.subTest(field=field):
+                item = self.item | {field: self.item[field].upper()}
+                result = carbon.calculate(carbon.CalculationRequest(items=[item]), (self.factor,))
+                self.assertIsNone(result.total_kg_co2e)
+                self.assertEqual(result.calculated_items, [])
+                self.assertEqual(len(result.unsupported_items), 1)
 
     def test_phase5_shape_and_explicit_unknown_provider(self):
         item = {k: v for k, v in self.item.items() if k != "provider"}

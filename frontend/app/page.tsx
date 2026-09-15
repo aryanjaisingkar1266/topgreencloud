@@ -85,7 +85,7 @@ export default function Home() {
       <section className="workspace" id="providers" aria-labelledby="providers-title">
         <span className="section-kicker">SOURCED INFORMATION</span>
         <h2 id="providers-title">Compare cloud providers</h2>
-        <p>Select 2–4 providers. Metrics are shown as published; no scores or rankings are inferred.</p>
+        <p>Select 2–4 providers. This is provider-published information, not a ranking. Reporting periods, company scope, and measurement methods differ; read each source and its qualifications before comparing.</p>
         <form className="actions" onSubmit={filter}>
           <label>Search providers<input value={search} maxLength={120} onChange={e => setSearch(e.target.value)} placeholder="Name or slug" /></label>
           <label>Sort<select value={sort} onChange={e => setSort(e.target.value)}><option value="name">Name: A–Z</option><option value="-name">Name: Z–A</option></select></label>
@@ -100,7 +100,7 @@ export default function Home() {
         {comparison.length > 0 && <div className="table-scroll" tabIndex={0} role="region" aria-label="Provider comparison"><table><caption>Sustainability information in your selected order</caption><thead><tr>{comparison.map(provider => <th scope="col" key={provider.id}>{provider.name}</th>)}</tr></thead><tbody><tr>{comparison.map(provider => <td key={provider.id}>
           {safeLink(provider.website_url) && <p><a href={safeLink(provider.website_url)} target="_blank" rel="noopener noreferrer">Provider website ↗</a></p>}
           {!provider.metrics?.length && <p>No sustainability metrics published here yet.</p>}
-          {provider.metrics?.map((metric, i) => <div className="metric" key={i}><strong>{metric.metric_name}</strong><p>{metric.metric_value}{metric.unit && ` ${metric.unit}`}</p>{metric.notes && <p>{metric.notes}</p>}{safeLink(metric.source_url) && <a href={safeLink(metric.source_url)} target="_blank" rel="noopener noreferrer">View source ↗</a>}{metric.source_date && <p>Source date: {metric.source_date}</p>}</div>)}
+          {provider.metrics?.map((metric, i) => <div className="metric" key={i}><strong>{metric.metric_name}</strong><p>{metric.metric_value}{metric.unit && ` ${metric.unit}`}</p>{metric.notes && <p>{metric.notes}</p>}{safeLink(metric.source_url) && <a href={safeLink(metric.source_url)} target="_blank" rel="noopener noreferrer">Read provider source ↗</a>}{metric.source_date && <p>Source date: {metric.source_date}</p>}</div>)}
         </td>)}</tr></tbody></table></div>}
       </section>
 
