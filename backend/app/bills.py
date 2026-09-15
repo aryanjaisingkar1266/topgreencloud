@@ -10,9 +10,14 @@ from pydantic import BaseModel
 from pypdf import PdfReader, apply_configuration
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import UploadFile
+from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session
 
+from app import config, storage
 from app.auth import get_current_user
-from app.models import User
+from app.db import get_db
+from app.models import CloudProvider, UploadedBill, User
 
 router = APIRouter(prefix="/bills", tags=["bills"])
 MAX_FILE_SIZE = 10 * 1024 * 1024
@@ -49,6 +54,7 @@ class Item(BaseModel):
 
 
 class ParsedBill(BaseModel):
+    bill_id: int | None = None
     filename: str
     file_type: Literal["csv", "pdf"]
     provider: Literal["aws", "azure", "gcp"] | None
@@ -173,7 +179,8 @@ def pdf_bill(data: bytes):
 
 
 @router.post("/upload", response_model=ParsedBill)
-async def upload(request: Request, response: Response, user: Annotated[User, Depends(get_current_user)]):
+async def upload(request: Request, response: Response, user: Annotated[User, Depends(get_current_user)],
+                 db: Annotated[Session, Depends(get_db)]):
     # Bound the entire body before multipart parsing can spool unbounded input.
     body = bytearray()
     async for chunk in request.stream():
@@ -209,6 +216,52 @@ async def upload(request: Request, response: Response, user: Annotated[User, Dep
     except Exception:
         raise HTTPException(422, "Malformed multipart upload") from None
     provider, items, warnings = await run_in_threadpool(csv_bill if kind == "csv" else pdf_bill, data)
+    bill_id = None
+    if config.GCS_BUCKET:
+        bill_id = await run_in_threadpool(save_bill, db, user.id, filename, kind, data, provider)
     response.headers["Cache-Control"] = "no-store"
-    return ParsedBill(filename=filename, file_type=kind, provider=provider,
+    return ParsedBill(bill_id=bill_id, filename=filename, file_type=kind, provider=provider,
                       row_count=len(items), items=items, warnings=warnings)
+
+
+def save_bill(db: Session, user_id: int, filename: str, kind: str, data: bytes, provider: str | None) -> int:
+    provider_id = db.scalar(select(CloudProvider.id).where(CloudProvider.slug == provider)) if provider else None
+    key = storage.object_key(user_id, kind)
+    try:
+        storage.upload_bill(key, data, kind)
+    except storage.StorageError:
+        raise HTTPException(503, "Bill could not be stored. Please try again.") from None
+    try:
+        bill = UploadedBill(user_id=user_id, provider_id=provider_id, original_filename=filename,
+                            storage_key=key, file_type=kind, file_size=len(data), status="parsed")
+        db.add(bill)
+        db.flush()
+        bill_id = bill.id
+        db.commit()
+        return bill_id
+    except SQLAlchemyError:
+        db.rollback()
+        try:
+            storage.delete_bill(key)
+        except storage.StorageError:
+            logging.getLogger(__name__).warning("Bill object cleanup failed")
+        raise HTTPException(503, "Bill metadata could not be saved. Please try again.") from None
+
+
+@router.delete("/{bill_id}", status_code=204)
+def delete_bill(bill_id: int, user: Annotated[User, Depends(get_current_user)],
+                db: Annotated[Session, Depends(get_db)]):
+    bill = db.scalar(select(UploadedBill).where(
+        UploadedBill.id == bill_id, UploadedBill.user_id == user.id
+    ).with_for_update())
+    if bill is None:
+        raise HTTPException(404, "Bill not found")
+    try:
+        storage.delete_bill(bill.storage_key)
+        db.delete(bill)
+        db.commit()
+    except (storage.StorageError, SQLAlchemyError):
+        db.rollback()
+        # Keep metadata on failure so a retry can finish deletion of a missing object.
+        raise HTTPException(503, "Bill deletion could not be completed. Please retry.") from None
+    return Response(status_code=204, headers={"Cache-Control": "no-store"})

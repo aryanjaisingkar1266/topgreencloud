@@ -7,6 +7,7 @@ if not DATABASE_URL.startswith("postgresql+psycopg://"):
 JWT_SECRET = os.environ.get("JWT_SECRET", "")
 JWT_ALGORITHM = os.environ.get("JWT_ALGORITHM", "HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.environ.get("ACCESS_TOKEN_EXPIRE_MINUTES", "30"))
+GCS_BUCKET = os.environ.get("GCS_BUCKET", "").strip()
 
 
 def validate_auth_config():

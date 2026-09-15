@@ -30,7 +30,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[frontend_origin],
     allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
 )
 app.add_exception_handler(RequestValidationError, validation_error)
